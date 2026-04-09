@@ -76,6 +76,8 @@ class GatewayStreamConsumer:
         self._last_sent_text = ""   # Track last-sent text to skip redundant edits
         self._fallback_final_send = False
         self._fallback_prefix = ""
+        # Feishu CardKit streaming card support
+        self._uses_streaming_card = getattr(adapter, "streaming_cards_enabled", False) is True
 
     @property
     def already_sent(self) -> bool:
@@ -154,11 +156,13 @@ class GatewayStreamConsumer:
                             # remaining continuation without dropping content.
                             break
                         self._accumulated = self._accumulated[split_at:].lstrip("\n")
+                        # Stop the current streaming card before starting a new one
+                        await self._stop_streaming_card_if_active()
                         self._message_id = None
                         self._last_sent_text = ""
 
                     display_text = self._accumulated
-                    if not got_done and not got_segment_break:
+                    if not got_done and not got_segment_break and not self._uses_streaming_card:
                         display_text += self.cfg.cursor
 
                     await self._send_or_edit(display_text)
@@ -176,6 +180,8 @@ class GatewayStreamConsumer:
                             await self._send_or_edit(self._accumulated)
                         elif not self._already_sent:
                             await self._send_or_edit(self._accumulated)
+                    # Finalize any active streaming card
+                    await self._stop_streaming_card_if_active()
                     return
 
                 # Tool boundary: the should_edit block above already flushed
@@ -183,6 +189,7 @@ class GatewayStreamConsumer:
                 # text chunk creates a fresh message below any tool-progress
                 # messages the gateway sent in between.
                 if got_segment_break:
+                    await self._stop_streaming_card_if_active()
                     self._message_id = None
                     self._accumulated = ""
                     self._last_sent_text = ""
@@ -198,8 +205,16 @@ class GatewayStreamConsumer:
                     await self._send_or_edit(self._accumulated)
                 except Exception:
                     pass
+            try:
+                await self._stop_streaming_card_if_active()
+            except Exception:
+                pass
         except Exception as e:
             logger.error("Stream consumer error: %s", e)
+            try:
+                await self._stop_streaming_card_if_active()
+            except Exception:
+                pass
 
     # Pattern to strip MEDIA:<path> tags (including optional surrounding quotes).
     # Matches the simple cleanup regex used by the non-streaming path in
@@ -344,11 +359,18 @@ class GatewayStreamConsumer:
                     pass
             else:
                 # First message — send new
-                result = await self.adapter.send(
-                    chat_id=self.chat_id,
-                    content=text,
-                    metadata=self.metadata,
-                )
+                if self._uses_streaming_card:
+                    result = await self.adapter.send_streaming_card(
+                        chat_id=self.chat_id,
+                        content=text,
+                        metadata=self.metadata,
+                    )
+                else:
+                    result = await self.adapter.send(
+                        chat_id=self.chat_id,
+                        content=text,
+                        metadata=self.metadata,
+                    )
                 if result.success and result.message_id:
                     self._message_id = result.message_id
                     self._already_sent = True
@@ -369,3 +391,10 @@ class GatewayStreamConsumer:
                     self._edit_supported = False
         except Exception as e:
             logger.error("Stream send/edit error: %s", e)
+
+    async def _stop_streaming_card_if_active(self) -> None:
+        """Stop the streaming card if the adapter supports it and one is active."""
+        if self._uses_streaming_card and self._message_id is not None:
+            stop_fn = getattr(self.adapter, "stop_streaming_card", None)
+            if stop_fn is not None:
+                await stop_fn(self._message_id)
