@@ -1100,11 +1100,13 @@ def check_feishu_requirements() -> bool:
 
 
 class FeishuAdapter(BasePlatformAdapter):
-    STREAMING_CURSOR = ""
-    STREAMING_EDIT_INTERVAL = 0.04
-    STREAMING_BUFFER_THRESHOLD = 1
-
     """Feishu/Lark bot adapter."""
+
+    STREAMING_CURSOR = ""
+    # Feishu interactive card patches are rate limited to ~5 QPS per message,
+    # so keep the default cadence comfortably below that ceiling.
+    STREAMING_EDIT_INTERVAL = 0.25
+    STREAMING_BUFFER_THRESHOLD = 8
 
     MAX_MESSAGE_LENGTH = 8000
     # Threshold for detecting Feishu client-side message splits.
@@ -1473,7 +1475,12 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("[Feishu] Stream card send failed; falling back to plain send: %s", exc)
 
-        return await self.send(chat_id=chat_id, content=content, metadata=metadata)
+        return await self.send(
+            chat_id=chat_id,
+            content=content,
+            reply_to=(metadata or {}).get("source_message_id"),
+            metadata=metadata,
+        )
 
     async def edit_stream_message(
         self,
@@ -1618,7 +1625,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 }
 
             card = {
-                "config": {"wide_screen_mode": True},
+                "config": {"wide_screen_mode": True, "update_multi": True},
                 "header": {
                     "title": {"content": "⚠️ Command Approval Required", "tag": "plain_text"},
                     "template": "orange",
@@ -1667,7 +1674,7 @@ class FeishuAdapter(BasePlatformAdapter):
         icon = "❌" if choice == "deny" else "✅"
         label = _APPROVAL_LABEL_MAP.get(choice, "Resolved")
         return {
-            "config": {"wide_screen_mode": True},
+            "config": {"wide_screen_mode": True, "update_multi": True},
             "header": {
                 "title": {"content": f"{icon} {label}", "tag": "plain_text"},
                 "template": "red" if choice == "deny" else "green",
