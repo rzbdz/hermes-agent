@@ -87,6 +87,15 @@ class GatewayStreamConsumer:
         self.adapter = adapter
         self.chat_id = chat_id
         self.cfg = config or StreamConsumerConfig()
+        self.cfg.edit_interval = float(getattr(adapter, "STREAMING_EDIT_INTERVAL", self.cfg.edit_interval)) \
+            if self._adapter_has(adapter, "STREAMING_EDIT_INTERVAL") or "STREAMING_EDIT_INTERVAL" in adapter.__dict__ \
+            else self.cfg.edit_interval
+        self.cfg.buffer_threshold = int(getattr(adapter, "STREAMING_BUFFER_THRESHOLD", self.cfg.buffer_threshold)) \
+            if self._adapter_has(adapter, "STREAMING_BUFFER_THRESHOLD") or "STREAMING_BUFFER_THRESHOLD" in adapter.__dict__ \
+            else self.cfg.buffer_threshold
+        self.cfg.cursor = str(getattr(adapter, "STREAMING_CURSOR", self.cfg.cursor)) \
+            if self._adapter_has(adapter, "STREAMING_CURSOR") or "STREAMING_CURSOR" in adapter.__dict__ \
+            else self.cfg.cursor
         self.metadata = metadata
         self._queue: queue.Queue = queue.Queue()
         self._accumulated = ""
@@ -734,6 +743,30 @@ class GatewayStreamConsumer:
             logger.error("Commentary send error: %s", e)
             return False
 
+    @staticmethod
+    def _adapter_has(adapter: Any, name: str) -> bool:
+        """True only if the adapter's concrete class explicitly defines *name*."""
+        for cls in type(adapter).__mro__:
+            if cls is object:
+                break
+            if name in cls.__dict__:
+                return True
+        return False
+
+    async def _send_stream_message(self, text: str):
+        # Check instance __dict__ first (explicit assignment in tests/subclasses),
+        # then class hierarchy (real adapter method definitions).
+        if "send_stream_message" in self.adapter.__dict__ or self._adapter_has(self.adapter, "send_stream_message"):
+            return await self.adapter.send_stream_message(chat_id=self.chat_id, content=text, metadata=self.metadata)
+        return await self.adapter.send(chat_id=self.chat_id, content=text, metadata=self.metadata)
+
+    async def _edit_stream_message(self, text: str, *, finalize: bool = False):
+        if "edit_stream_message" in self.adapter.__dict__ or self._adapter_has(self.adapter, "edit_stream_message"):
+            return await self.adapter.edit_stream_message(chat_id=self.chat_id, message_id=self._message_id, content=text)
+        return await self.adapter.edit_message(
+            chat_id=self.chat_id, message_id=self._message_id, content=text, finalize=finalize,
+        )
+
     async def _send_or_edit(self, text: str, *, finalize: bool = False) -> bool:
         """Send or edit the streaming message.
 
@@ -743,7 +776,7 @@ class GatewayStreamConsumer:
 
         ``finalize`` is True when this is the last edit in a streaming
         sequence.
-        """
+        """ 
         # Strip MEDIA: directives so they don't appear as visible text.
         # Media files are delivered as native attachments after the stream
         # finishes (via _deliver_media_from_response in gateway/run.py).
@@ -787,12 +820,7 @@ class GatewayStreamConsumer:
                     ):
                         return True
                     # Edit existing message
-                    result = await self.adapter.edit_message(
-                        chat_id=self.chat_id,
-                        message_id=self._message_id,
-                        content=text,
-                        finalize=finalize,
-                    )
+                    result = await self._edit_stream_message(text, finalize=finalize)
                     if result.success:
                         self._already_sent = True
                         self._last_sent_text = text
@@ -844,11 +872,7 @@ class GatewayStreamConsumer:
                     return False
             else:
                 # First message — send new
-                result = await self.adapter.send(
-                    chat_id=self.chat_id,
-                    content=text,
-                    metadata=self.metadata,
-                )
+                result = await self._send_stream_message(text)
                 if result.success:
                     if result.message_id:
                         self._message_id = result.message_id

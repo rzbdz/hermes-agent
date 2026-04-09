@@ -364,6 +364,93 @@ class TestStreamRunMediaStripping:
 # ── Segment break (tool boundary) tests ──────────────────────────────────
 
 
+class TestFeishuStreamingHooks:
+    """Feishu can override the generic text-edit transport with card streaming hooks."""
+
+    @pytest.mark.asyncio
+    async def test_first_send_uses_adapter_stream_send_hook_when_available(self):
+        adapter = MagicMock()
+        adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="plain_msg"))
+        adapter.send_stream_message = AsyncMock(return_value=SimpleNamespace(success=True, message_id="card_msg"))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(adapter, "chat_123")
+        await consumer._send_or_edit("Hello from stream")
+
+        adapter.send_stream_message.assert_called_once_with(
+            chat_id="chat_123",
+            content="Hello from stream",
+            metadata=None,
+        )
+        adapter.send.assert_not_called()
+        assert consumer._message_id == "card_msg"
+
+    @pytest.mark.asyncio
+    async def test_edit_uses_adapter_stream_edit_hook_when_available(self):
+        adapter = MagicMock()
+        adapter.send_stream_message = AsyncMock(return_value=SimpleNamespace(success=True, message_id="card_msg"))
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.edit_stream_message = AsyncMock(return_value=SimpleNamespace(success=True, message_id="card_msg"))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(adapter, "chat_123")
+        await consumer._send_or_edit("Hello")
+        await consumer._send_or_edit("Hello world")
+
+        adapter.edit_stream_message.assert_called_once_with(
+            chat_id="chat_123",
+            message_id="card_msg",
+            content="Hello world",
+        )
+        adapter.edit_message.assert_not_called()
+
+
+class TestAdapterStreamingOverrides:
+    """Adapters can override cursor/timing defaults for platform-native streaming."""
+
+    def test_adapter_can_disable_cursor(self):
+        adapter = MagicMock()
+        adapter.STREAMING_CURSOR = ""
+
+        consumer = GatewayStreamConsumer(adapter, "chat_123")
+
+        assert consumer.cfg.cursor == ""
+
+    def test_adapter_can_tune_streaming_timing(self):
+        adapter = MagicMock()
+        adapter.STREAMING_EDIT_INTERVAL = 0.1
+        adapter.STREAMING_BUFFER_THRESHOLD = 12
+
+        consumer = GatewayStreamConsumer(adapter, "chat_123")
+
+        assert consumer.cfg.edit_interval == 0.1
+        assert consumer.cfg.buffer_threshold == 12
+
+
+class TestInitialSendThreshold:
+    """Adapters can delay the first visible stream frame to avoid tiny pre-tool fragments."""
+
+    @pytest.mark.asyncio
+    async def test_segment_break_drops_tiny_initial_fragment_below_threshold(self):
+        adapter = MagicMock()
+        adapter.STREAMING_MIN_INITIAL_CHARS = 4
+        adapter.send = AsyncMock(side_effect=[SimpleNamespace(success=True, message_id="msg_1")])
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(adapter, "chat_123", StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1, cursor=""))
+        consumer.on_delta("阿")
+        consumer.on_delta(None)
+        consumer.on_delta("彪你好")
+        consumer.finish()
+
+        await consumer.run()
+
+        assert adapter.send.call_count == 1
+        sent_text = adapter.send.call_args_list[0][1]["content"]
+        assert sent_text == "彪你好"
+
+
 class TestSegmentBreakOnToolBoundary:
     """Verify that on_delta(None) finalizes the current message and starts a
     new one so the final response appears below tool-progress messages."""
