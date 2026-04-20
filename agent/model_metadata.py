@@ -1064,20 +1064,18 @@ def get_model_context_length(
             context_length = matched.get("context_length")
             if isinstance(context_length, int):
                 return context_length
-        if not _is_known_provider_base_url(base_url):
-            # 3. Try querying local server directly
-            if is_local_endpoint(base_url):
-                local_ctx = _query_local_context_length(model, base_url, api_key=api_key)
-                if local_ctx and local_ctx > 0:
-                    save_context_length(model, base_url, local_ctx)
-                    return local_ctx
-            logger.info(
-                "Could not detect context length for model %r at %s — "
-                "defaulting to %s tokens (probe-down). Set model.context_length "
-                "in config.yaml to override.",
-                model, base_url, f"{DEFAULT_FALLBACK_CONTEXT:,}",
-            )
-            return DEFAULT_FALLBACK_CONTEXT
+        # 3. Try querying local server directly
+        if is_local_endpoint(base_url):
+            local_ctx = _query_local_context_length(model, base_url, api_key=api_key)
+            if local_ctx and local_ctx > 0:
+                save_context_length(model, base_url, local_ctx)
+                return local_ctx
+        # Endpoint didn't report context_length — fall through to
+        # models.dev / OpenRouter / hardcoded defaults instead of
+        # returning the 128K fallback immediately.  Proxy endpoints
+        # (e.g. LiteLLM, NewAPI) often omit context_length from
+        # /models but serve well-known models whose metadata is
+        # available in downstream registries.
 
     # 4. Anthropic /v1/models API (only for regular API keys, not OAuth)
     if provider == "anthropic" or (

@@ -1581,9 +1581,6 @@ class AIAgent:
                 )
                 _config_context_length = None
 
-        # Store for reuse in switch_model (so config override persists across model switches)
-        self._config_context_length = _config_context_length
-
         # Check custom_providers per-model context_length
         if _config_context_length is None:
             try:
@@ -1621,6 +1618,11 @@ class AIAgent:
                                         file=sys.stderr,
                                     )
                     break
+
+        # Store for reuse in switch_model (so config override persists across
+        # model switches).  Must be set *after* the custom_providers lookup above
+        # so that per-model overrides from custom_providers are captured.
+        self._config_context_length = _config_context_length
         
         # Select context engine: config-driven (like memory providers).
         # 1. Check config.yaml context.engine setting
@@ -1956,6 +1958,54 @@ class AIAgent:
 
         # ── Update context compressor ──
         if hasattr(self, "context_compressor") and self.context_compressor:
+            # Re-resolve config_context_length for the *new* model from
+            # custom_providers.  The value stored at init time may belong to
+            # the previous model; we need the per-model override that matches
+            # the new (model, base_url) pair.
+            #
+            # Start from the top-level model.context_length (if any) — this is
+            # the global override that applies regardless of which custom
+            # provider is active.  Per-model overrides from custom_providers
+            # take precedence and are checked below.
+            _switch_config_ctx = None
+            try:
+                from hermes_cli.config import load_config as _load_switch_config
+                _sw_cfg = _load_switch_config()
+            except Exception:
+                _sw_cfg = {}
+            _sw_model_section = _sw_cfg.get("model", {})
+            if isinstance(_sw_model_section, dict):
+                _sw_top_ctx = _sw_model_section.get("context_length")
+                if _sw_top_ctx is not None:
+                    try:
+                        _switch_config_ctx = int(_sw_top_ctx)
+                    except (TypeError, ValueError):
+                        pass
+            try:
+                from hermes_cli.config import get_compatible_custom_providers
+                _sw_custom_providers = get_compatible_custom_providers(_sw_cfg)
+            except Exception:
+                _sw_custom_providers = _sw_cfg.get("custom_providers")
+                if not isinstance(_sw_custom_providers, list):
+                    _sw_custom_providers = []
+            for _sw_cp in _sw_custom_providers:
+                if not isinstance(_sw_cp, dict):
+                    continue
+                _sw_cp_url = (_sw_cp.get("base_url") or "").rstrip("/")
+                if _sw_cp_url and _sw_cp_url == self.base_url.rstrip("/"):
+                    _sw_models = _sw_cp.get("models", {})
+                    if isinstance(_sw_models, dict):
+                        _sw_model_cfg = _sw_models.get(self.model, {})
+                        if isinstance(_sw_model_cfg, dict):
+                            _sw_ctx = _sw_model_cfg.get("context_length")
+                            if _sw_ctx is not None:
+                                try:
+                                    _switch_config_ctx = int(_sw_ctx)
+                                except (TypeError, ValueError):
+                                    pass
+                    break
+            self._config_context_length = _switch_config_ctx
+
             from agent.model_metadata import get_model_context_length
             new_context_length = get_model_context_length(
                 self.model,

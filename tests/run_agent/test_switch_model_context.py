@@ -42,14 +42,22 @@ def _make_agent_with_compressor(config_context_length=None) -> AIAgent:
 
 @patch("agent.model_metadata.get_model_context_length", return_value=131_072)
 def test_switch_model_preserves_config_context_length(mock_ctx_len):
-    """When switching models, config_context_length should be passed to get_model_context_length."""
+    """When switching models, config_context_length should be passed to get_model_context_length.
+
+    The top-level model.context_length from config.yaml is a global override
+    that applies to all models.  switch_model re-reads it from config so it
+    persists across model switches.
+    """
     agent = _make_agent_with_compressor(config_context_length=32_768)
 
     assert agent.context_compressor.model == "primary-model"
     assert agent.context_compressor.context_length == 32_768  # From config override
 
-    # Switch model
-    agent.switch_model("new-model", "openrouter", api_key="sk-new", base_url="https://openrouter.ai/api/v1")
+    # Mock load_config to return the top-level context_length override
+    cfg = {"model": {"context_length": 32_768}}
+    with patch("hermes_cli.config.load_config", return_value=cfg):
+        # Switch model
+        agent.switch_model("new-model", "openrouter", api_key="sk-new", base_url="https://openrouter.ai/api/v1")
 
     # Verify get_model_context_length was called with config_context_length
     mock_ctx_len.assert_called_once()
@@ -64,7 +72,11 @@ def test_switch_model_without_config_context_length():
     """When switching models without config override, config_context_length should be None."""
     agent = _make_agent_with_compressor(config_context_length=None)
 
-    with patch("agent.model_metadata.get_model_context_length", return_value=128_000) as mock_ctx_len:
+    cfg = {"model": {}}  # No context_length in config
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("agent.model_metadata.get_model_context_length", return_value=128_000) as mock_ctx_len,
+    ):
         # Switch model
         agent.switch_model("new-model", "openrouter", api_key="sk-new", base_url="https://openrouter.ai/api/v1")
 
