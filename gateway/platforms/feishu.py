@@ -1687,6 +1687,25 @@ class FeishuAdapter(BasePlatformAdapter):
             ],
         }
 
+    async def _update_approval_card(
+        self, message_id: str, label: str, user_name: str, choice: str
+    ) -> None:
+        """Patch an approval interactive card to show the resolved state."""
+        if not self._client:
+            return
+        card = self._build_resolved_approval_card(choice=choice, user_name=user_name)
+        # Override the label with the caller-supplied text (may differ from the
+        # default _APPROVAL_LABEL_MAP entry, e.g. "Approved permanently").
+        icon = "❌" if choice == "deny" else "✅"
+        card["header"]["title"]["content"] = f"{icon} {label}"
+        try:
+            payload = json.dumps(card, ensure_ascii=False)
+            body = self._build_patch_message_body(content=payload)
+            request = self._build_patch_message_request(message_id=message_id, request_body=body)
+            await asyncio.to_thread(self._client.im.v1.message.patch, request)
+        except Exception as exc:
+            logger.warning("[Feishu] Failed to update approval card %s: %s", message_id, exc)
+
     async def send_voice(
         self,
         chat_id: str,
