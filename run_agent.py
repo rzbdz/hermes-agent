@@ -124,7 +124,7 @@ from agent.trajectory import (
     convert_scratchpad_to_think, has_incomplete_scratchpad,
     save_trajectory as _save_trajectory_to_file,
 )
-from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_var_enabled
+from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_var_enabled, normalize_proxy_url
 
 
 
@@ -187,7 +187,7 @@ def _get_proxy_from_env() -> Optional[str]:
                 "https_proxy", "http_proxy", "all_proxy"):
         value = os.environ.get(key, "").strip()
         if value:
-            return value
+            return normalize_proxy_url(value)
     return None
 
 
@@ -2055,6 +2055,22 @@ class AIAgent:
         self._fallback_activated = False
         self._fallback_index = 0
 
+        # When the user deliberately swaps primary providers (e.g. openrouter
+        # → anthropic), drop any fallback entries that target the OLD primary
+        # or the NEW one.  The chain was seeded from config at agent init for
+        # the original provider — without pruning, a failed turn on the new
+        # primary silently re-activates the provider the user just rejected,
+        # which is exactly what was reported during TUI v2 blitz testing
+        # ("switched to anthropic, tui keeps trying openrouter").
+        old_norm = (old_provider or "").strip().lower()
+        new_norm = (new_provider or "").strip().lower()
+        if old_norm and new_norm and old_norm != new_norm:
+            self._fallback_chain = [
+                entry for entry in self._fallback_chain
+                if (entry.get("provider") or "").strip().lower() not in {old_norm, new_norm}
+            ]
+            self._fallback_model = self._fallback_chain[0] if self._fallback_chain else None
+
         logging.info(
             "Model switched in-place: %s (%s) -> %s (%s)",
             old_model, old_provider, new_model, new_provider,
@@ -2405,6 +2421,13 @@ class AIAgent:
         cost reduction as direct Anthropic callers, provided their
         gateway implements the Anthropic cache_control contract
         (MiniMax, Zhipu GLM, LiteLLM's Anthropic proxy mode all do).
+
+        Qwen / Alibaba-family models on OpenCode, OpenCode Go, and direct
+        Alibaba (DashScope) also honour Anthropic-style ``cache_control``
+        markers on OpenAI-wire chat completions. Upstream pi-mono #3392 /
+        pi #3393 documented this for opencode-go Qwen. Without markers
+        these providers serve zero cache hits, re-billing the full prompt
+        on every turn.
         """
         eff_provider = (provider if provider is not None else self.provider) or ""
         eff_base_url = base_url if base_url is not None else (self.base_url or "")
@@ -2412,7 +2435,9 @@ class AIAgent:
         eff_model = (model if model is not None else self.model) or ""
 
         base_lower = eff_base_url.lower()
-        is_claude = "claude" in eff_model.lower()
+        model_lower = eff_model.lower()
+        provider_lower = eff_provider.lower()
+        is_claude = "claude" in model_lower
         is_openrouter = base_url_host_matches(eff_base_url, "openrouter.ai")
         is_anthropic_wire = eff_api_mode == "anthropic_messages"
         is_native_anthropic = (
@@ -2427,6 +2452,22 @@ class AIAgent:
         if is_anthropic_wire and is_claude:
             # Third-party Anthropic-compatible gateway.
             return True, True
+
+        # Qwen/Alibaba on OpenCode (Zen/Go) and native DashScope: OpenAI-wire
+        # transport that accepts Anthropic-style cache_control markers and
+        # rewards them with real cache hits.  Without this branch
+        # qwen3.6-plus on opencode-go reports 0% cached tokens and burns
+        # through the subscription on every turn.
+        model_is_qwen = "qwen" in model_lower
+        provider_is_alibaba_family = provider_lower in {
+            "opencode", "opencode-zen", "opencode-go", "alibaba",
+        }
+        if provider_is_alibaba_family and model_is_qwen:
+            # Envelope layout (native_anthropic=False): markers on inner
+            # content parts, not top-level tool messages.  Matches
+            # pi-mono's "alibaba" cacheControlFormat.
+            return True, False
+
         return False, False
 
     @staticmethod
@@ -6173,8 +6214,9 @@ class AIAgent:
             fb_base_url_hint = (fb.get("base_url") or "").strip() or None
             fb_api_key_hint = (fb.get("api_key") or "").strip() or None
             # For Ollama Cloud endpoints, pull OLLAMA_API_KEY from env
-            # when no explicit key is in the fallback config.
-            if fb_base_url_hint and "ollama.com" in fb_base_url_hint.lower() and not fb_api_key_hint:
+            # when no explicit key is in the fallback config. Host match
+            # (not substring) — see GHSA-76xc-57q6-vm5m.
+            if fb_base_url_hint and base_url_host_matches(fb_base_url_hint, "ollama.com") and not fb_api_key_hint:
                 fb_api_key_hint = os.getenv("OLLAMA_API_KEY") or None
             fb_client, _resolved_fb_model = resolve_provider_client(
                 fb_provider, model=fb_model, raw_codex=True,
@@ -6959,6 +7001,34 @@ class AIAgent:
             # (the documented max output for qwen3-coder models) so the
             # model has adequate output budget for tool calls.
             api_kwargs.update(self._max_tokens_param(65536))
+        elif (
+            base_url_host_matches(self.base_url, "api.kimi.com")
+            or base_url_host_matches(self.base_url, "moonshot.ai")
+            or base_url_host_matches(self.base_url, "moonshot.cn")
+        ):
+            # Kimi/Moonshot defaults to a low max_tokens when omitted.
+            # Reasoning tokens share the output budget — without an explicit
+            # value the model can exhaust it on thinking alone, causing
+            # "Response truncated due to output length limit".  32000 matches
+            # Kimi CLI's default (see MoonshotAI/kimi-cli kimi.py generate()).
+            api_kwargs.update(self._max_tokens_param(32000))
+            # Kimi requires reasoning_effort as a top-level chat completions
+            # parameter (not inside extra_body).  Mirror Kimi CLI's
+            # with_generation_kwargs(reasoning_effort=...) / with_thinking():
+            # when thinking is disabled, Kimi CLI omits reasoning_effort
+            # entirely (maps to None).
+            _kimi_thinking_off = bool(
+                self.reasoning_config
+                and isinstance(self.reasoning_config, dict)
+                and self.reasoning_config.get("enabled") is False
+            )
+            if not _kimi_thinking_off:
+                _kimi_effort = "medium"
+                if self.reasoning_config and isinstance(self.reasoning_config, dict):
+                    _e = (self.reasoning_config.get("effort") or "").strip().lower()
+                    if _e in ("low", "medium", "high"):
+                        _kimi_effort = _e
+                api_kwargs["reasoning_effort"] = _kimi_effort
         elif (self._is_openrouter_url() or "nousresearch" in self._base_url_lower) and "claude" in (self.model or "").lower():
             # OpenRouter and Nous Portal translate requests to Anthropic's
             # Messages API, which requires max_tokens as a mandatory field.
@@ -6989,6 +7059,24 @@ class AIAgent:
         if provider_preferences and _is_openrouter:
             extra_body["provider"] = provider_preferences
         _is_nous = "nousresearch" in self._base_url_lower
+
+        # Kimi/Moonshot API uses extra_body.thinking (separate from the
+        # top-level reasoning_effort) to enable/disable reasoning mode.
+        # Mirror Kimi CLI's with_thinking() behavior exactly — see
+        # MoonshotAI/kimi-cli packages/kosong/src/kosong/chat_provider/kimi.py
+        _is_kimi = (
+            base_url_host_matches(self.base_url, "api.kimi.com")
+            or base_url_host_matches(self.base_url, "moonshot.ai")
+            or base_url_host_matches(self.base_url, "moonshot.cn")
+        )
+        if _is_kimi:
+            _kimi_thinking_enabled = True
+            if self.reasoning_config and isinstance(self.reasoning_config, dict):
+                if self.reasoning_config.get("enabled") is False:
+                    _kimi_thinking_enabled = False
+            extra_body["thinking"] = {
+                "type": "enabled" if _kimi_thinking_enabled else "disabled",
+            }
 
         if self._supports_reasoning_extra_body():
             if _is_github_models:
@@ -7607,8 +7695,27 @@ class AIAgent:
         finally:
             self._executing_tools = False
 
+    def _dispatch_delegate_task(self, function_args: dict) -> str:
+        """Single call site for delegate_task dispatch.
+
+        New DELEGATE_TASK_SCHEMA fields only need to be added here to reach all
+        invocation paths (concurrent, sequential, inline).
+        """
+        from tools.delegate_tool import delegate_task as _delegate_task
+        return _delegate_task(
+            goal=function_args.get("goal"),
+            context=function_args.get("context"),
+            toolsets=function_args.get("toolsets"),
+            tasks=function_args.get("tasks"),
+            max_iterations=function_args.get("max_iterations"),
+            acp_command=function_args.get("acp_command"),
+            acp_args=function_args.get("acp_args"),
+            role=function_args.get("role"),
+            parent_agent=self,
+        )
+
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
-                     tool_call_id: Optional[str] = None) -> str:
+                     tool_call_id: Optional[str] = None, messages: list = None) -> str:
         """Invoke a single tool and return the result string. No display logic.
 
         Handles both agent-level tools (todo, memory, etc.) and registry-dispatched
@@ -7676,15 +7783,7 @@ class AIAgent:
                 callback=self.clarify_callback,
             )
         elif function_name == "delegate_task":
-            from tools.delegate_tool import delegate_task as _delegate_task
-            return _delegate_task(
-                goal=function_args.get("goal"),
-                context=function_args.get("context"),
-                toolsets=function_args.get("toolsets"),
-                tasks=function_args.get("tasks"),
-                max_iterations=function_args.get("max_iterations"),
-                parent_agent=self,
-            )
+            return self._dispatch_delegate_task(function_args)
         else:
             return handle_function_call(
                 function_name, function_args, effective_task_id,
@@ -7846,7 +7945,7 @@ class AIAgent:
                 pass
             start = time.time()
             try:
-                result = self._invoke_tool(function_name, function_args, effective_task_id, tool_call.id)
+                result = self._invoke_tool(function_name, function_args, effective_task_id, tool_call.id, messages=messages)
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
@@ -8198,7 +8297,6 @@ class AIAgent:
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
             elif function_name == "delegate_task":
-                from tools.delegate_tool import delegate_task as _delegate_task
                 tasks_arg = function_args.get("tasks")
                 if tasks_arg and isinstance(tasks_arg, list):
                     spinner_label = f"🔀 delegating {len(tasks_arg)} tasks"
@@ -8213,14 +8311,7 @@ class AIAgent:
                 self._delegate_spinner = spinner
                 _delegate_result = None
                 try:
-                    function_result = _delegate_task(
-                        goal=function_args.get("goal"),
-                        context=function_args.get("context"),
-                        toolsets=function_args.get("toolsets"),
-                        tasks=tasks_arg,
-                        max_iterations=function_args.get("max_iterations"),
-                        parent_agent=self,
-                    )
+                    function_result = self._dispatch_delegate_task(function_args)
                     _delegate_result = function_result
                 finally:
                     self._delegate_spinner = None
@@ -8648,6 +8739,11 @@ class AIAgent:
         self._persist_user_message_override = persist_user_message
         # Generate unique task_id if not provided to isolate VMs between concurrent tasks
         effective_task_id = task_id or str(uuid.uuid4())
+        # Expose the active task_id so tools running mid-turn (e.g. delegate_task
+        # in delegate_tool.py) can identify this agent for the cross-agent file
+        # state registry.  Set BEFORE any tool dispatch so snapshots taken at
+        # child-launch time see the parent's real id, not None.
+        self._current_task_id = effective_task_id
         
         # Reset retry counters and iteration budget at the start of each turn
         # so subagent usage from a previous turn doesn't eat into the next one.
@@ -9885,22 +9981,27 @@ class AIAgent:
                         if self.verbose_logging:
                             logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")
                         
-                        # Log cache hit stats when prompt caching is active
-                        if self._use_prompt_caching:
-                            if self.api_mode == "anthropic_messages":
-                                _tcs = self._get_anthropic_transport()
-                                _cache = _tcs.extract_cache_stats(response)
-                                cached = _cache["cached_tokens"] if _cache else 0
-                                written = _cache["creation_tokens"] if _cache else 0
-                            else:
-                                # OpenRouter uses prompt_tokens_details.cached_tokens
-                                details = getattr(response.usage, 'prompt_tokens_details', None)
-                                cached = getattr(details, 'cached_tokens', 0) or 0 if details else 0
-                                written = getattr(details, 'cache_write_tokens', 0) or 0 if details else 0
-                            prompt = usage_dict["prompt_tokens"]
+                        # Surface cache hit stats for any provider that reports
+                        # them — not just those where we inject cache_control
+                        # markers.  OpenAI/Kimi/DeepSeek/Qwen all do automatic
+                        # server-side prefix caching and return
+                        # ``prompt_tokens_details.cached_tokens``; users
+                        # previously could not see their cache % because this
+                        # line was gated on ``_use_prompt_caching``, which is
+                        # only True for Anthropic-style marker injection.
+                        # ``canonical_usage`` is already normalised from all
+                        # three API shapes (Anthropic / Codex / OpenAI-chat)
+                        # so we can rely on its values directly.
+                        cached = canonical_usage.cache_read_tokens
+                        written = canonical_usage.cache_write_tokens
+                        prompt = usage_dict["prompt_tokens"]
+                        if (cached or written) and not self.quiet_mode:
                             hit_pct = (cached / prompt * 100) if prompt > 0 else 0
-                            if not self.quiet_mode:
-                                self._vprint(f"{self.log_prefix}   💾 Cache: {cached:,}/{prompt:,} tokens ({hit_pct:.0f}% hit, {written:,} written)")
+                            self._vprint(
+                                f"{self.log_prefix}   💾 Cache: "
+                                f"{cached:,}/{prompt:,} tokens "
+                                f"({hit_pct:.0f}% hit, {written:,} written)"
+                            )
                     
                     has_retried_429 = False  # Reset on success
                     # Clear Nous rate limit state on successful request —
