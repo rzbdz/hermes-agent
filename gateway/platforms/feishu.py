@@ -1434,10 +1434,6 @@ class FeishuAdapter(BasePlatformAdapter):
         formatted = self.format_message(content).strip()
         return {
             "config": {"wide_screen_mode": True, "update_multi": True},
-            "header": {
-                "title": {"content": "Hermes", "tag": "plain_text"},
-                "template": "blue",
-            },
             "elements": [
                 {
                     "tag": "markdown",
