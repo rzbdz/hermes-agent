@@ -216,10 +216,11 @@ def _cleanup_invalid_pid_path(pid_path: Path, *, cleanup_stale: bool) -> None:
     if not cleanup_stale:
         return
     try:
-        if pid_path == _get_pid_path():
-            remove_pid_file()
-        else:
-            pid_path.unlink(missing_ok=True)
+        # Use direct unlink here — remove_pid_file() guards against deleting
+        # a file owned by a *different* PID (to protect --replace handoffs),
+        # but in this context we already know the recorded process is dead or
+        # invalid, so it is always safe to remove the file unconditionally.
+        pid_path.unlink(missing_ok=True)
     except Exception:
         pass
 
