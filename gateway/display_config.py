@@ -41,6 +41,12 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # live, just cleaned up after success so the chat doesn't fill up with
     # stale breadcrumbs. Failed runs leave bubbles in place as breadcrumbs.
     "cleanup_progress": False,
+    # Seconds to buffer tool-progress lines before sending a single batched
+    # message on platforms that don't support edit_message (Weixin, iMessage,
+    # etc.). Prevents per-tool message spam while still giving the user
+    # progress feedback. Set to 0 to disable buffered progress on those
+    # platforms (reverts to silent behaviour).
+    "tool_progress_buffer_interval": 3.0,
 }
 
 # ---------------------------------------------------------------------------
@@ -203,4 +209,9 @@ def _normalise(setting: str, value: Any) -> Any:
             return int(value)
         except (TypeError, ValueError):
             return 0
+    if setting == "tool_progress_buffer_interval":
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            return 3.0
     return value

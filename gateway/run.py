@@ -14420,16 +14420,78 @@ class GatewayRunner:
             if not adapter:
                 return
 
-            # Skip tool progress for platforms that don't support message
-            # editing (e.g. iMessage/BlueBubbles) — each progress update
-            # would become a separate message bubble, which is noisy.
+            # No-edit platforms (Weixin, iMessage, etc.): use a time-buffered
+            # send instead of silently discarding progress. Lines accumulate for
+            # tool_progress_buffer_interval seconds then flush as one message.
+            # Set the interval to 0 to disable (original silent behaviour).
+            _NO_EDIT_BUFFER_SECS = resolve_display_setting(
+                user_config, platform_key, "tool_progress_buffer_interval", 3.0
+            )
             if type(adapter).edit_message is BasePlatformAdapter.edit_message:
-                while not progress_queue.empty():
+                if not _NO_EDIT_BUFFER_SECS:
+                    while not progress_queue.empty():
+                        try:
+                            progress_queue.get_nowait()
+                        except Exception:
+                            break
+                    return
+
+                _ne_buffer: list[str] = []
+                _ne_last_send = 0.0
+
+                def _ne_is_interrupted() -> bool:
                     try:
-                        progress_queue.get_nowait()
+                        _a = agent_holder[0] if agent_holder else None
+                        return _a is not None and getattr(_a, "is_interrupted", False)
                     except Exception:
-                        break
-                return
+                        return False
+
+                async def _ne_flush() -> None:
+                    if not _ne_buffer or not _run_still_current():
+                        return
+                    try:
+                        result = await adapter.send(
+                            chat_id=source.chat_id,
+                            content="\n".join(_ne_buffer),
+                            reply_to=_progress_reply_to,
+                            metadata=_progress_metadata,
+                        )
+                        if _cleanup_progress and getattr(result, "success", False) and getattr(result, "message_id", None):
+                            _cleanup_msg_ids.append(str(result.message_id))
+                    except Exception as e:
+                        logger.debug("No-edit progress send failed: %s", e)
+                    _ne_buffer.clear()
+
+                while True:
+                    try:
+                        if not _run_still_current():
+                            while not progress_queue.empty():
+                                try:
+                                    progress_queue.get_nowait()
+                                except Exception:
+                                    break
+                            return
+
+                        raw = progress_queue.get_nowait()
+                        if isinstance(raw, str) and not _ne_is_interrupted():
+                            _ne_buffer.append(raw)
+
+                    except queue.Empty:
+                        pass
+                    except asyncio.CancelledError:
+                        await _ne_flush()
+                        return
+                    except Exception as e:
+                        logger.error("Progress message error (no-edit buffer): %s", e)
+                        await asyncio.sleep(1)
+                        continue
+
+                    _now = time.monotonic()
+                    if _ne_buffer and (_now - _ne_last_send) >= _NO_EDIT_BUFFER_SECS:
+                        await _ne_flush()
+                        _ne_last_send = _now
+
+                    await asyncio.sleep(0.3)
 
             progress_lines = []      # Accumulated tool lines
             progress_msg_id = None   # ID of the progress message to edit
