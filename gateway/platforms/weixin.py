@@ -1639,7 +1639,10 @@ class WeixinAdapter(BasePlatformAdapter):
                             )
                             if attempt >= self._send_chunk_retries:
                                 break
-                            wait = self._send_chunk_retry_delay_seconds * 3  # 3x backoff for rate limit
+                            # Exponential backoff: 5s, 10s, 20s, 40s …
+                            # Fixed 3x was too short — rapid retries exhaust the
+                            # iLink quota window faster than the window resets.
+                            wait = self._send_chunk_retry_delay_seconds * (5 * (2 ** attempt))
                             logger.warning(
                                 "[%s] rate limited for %s; backing off %.1fs before retry",
                                 self.name, _safe_id(chat_id), wait,
