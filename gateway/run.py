@@ -14412,6 +14412,75 @@ class GatewayRunner:
             else None
         )
 
+        async def _send_progress_no_edit(adapter, interval: float) -> None:
+            """Buffered progress for platforms without edit_message (Weixin, iMessage…).
+
+            Accumulates string events and flushes them as a single message every
+            *interval* seconds.  interval=0 disables buffered progress entirely.
+            """
+            if not interval:
+                while not progress_queue.empty():
+                    try:
+                        progress_queue.get_nowait()
+                    except Exception:
+                        break
+                return
+
+            buf: list[str] = []
+            last_flush = time.monotonic()
+
+            def _is_interrupted() -> bool:
+                try:
+                    a = agent_holder[0] if agent_holder else None
+                    return a is not None and getattr(a, "is_interrupted", False)
+                except Exception:
+                    return False
+
+            async def _flush() -> None:
+                nonlocal last_flush
+                if not buf or not _run_still_current():
+                    return
+                try:
+                    result = await adapter.send(
+                        chat_id=source.chat_id,
+                        content="\n".join(buf),
+                        reply_to=_progress_reply_to,
+                        metadata=_progress_metadata,
+                    )
+                    if _cleanup_progress and getattr(result, "success", False) and getattr(result, "message_id", None):
+                        _cleanup_msg_ids.append(str(result.message_id))
+                except Exception as e:
+                    logger.debug("No-edit progress send failed: %s", e)
+                buf.clear()
+                last_flush = time.monotonic()
+
+            try:
+                while True:
+                    if not _run_still_current():
+                        # Run superseded — drain queue and flush remaining buffer
+                        while not progress_queue.empty():
+                            try:
+                                progress_queue.get_nowait()
+                            except Exception:
+                                break
+                        await _flush()
+                        return
+
+                    try:
+                        raw = progress_queue.get_nowait()
+                        if isinstance(raw, str) and not _is_interrupted():
+                            buf.append(raw)
+                    except queue.Empty:
+                        pass
+
+                    now = time.monotonic()
+                    if buf and (now - last_flush) >= interval:
+                        await _flush()
+
+                    await asyncio.sleep(0.3)
+            except asyncio.CancelledError:
+                await _flush()
+
         async def send_progress_messages():
             if not progress_queue:
                 return
@@ -14420,78 +14489,12 @@ class GatewayRunner:
             if not adapter:
                 return
 
-            # No-edit platforms (Weixin, iMessage, etc.): use a time-buffered
-            # send instead of silently discarding progress. Lines accumulate for
-            # tool_progress_buffer_interval seconds then flush as one message.
-            # Set the interval to 0 to disable (original silent behaviour).
-            _NO_EDIT_BUFFER_SECS = resolve_display_setting(
-                user_config, platform_key, "tool_progress_buffer_interval", 3.0
-            )
+            # No-edit platforms: buffered progress or silent drain
             if type(adapter).edit_message is BasePlatformAdapter.edit_message:
-                if not _NO_EDIT_BUFFER_SECS:
-                    while not progress_queue.empty():
-                        try:
-                            progress_queue.get_nowait()
-                        except Exception:
-                            break
-                    return
-
-                _ne_buffer: list[str] = []
-                _ne_last_send = 0.0
-
-                def _ne_is_interrupted() -> bool:
-                    try:
-                        _a = agent_holder[0] if agent_holder else None
-                        return _a is not None and getattr(_a, "is_interrupted", False)
-                    except Exception:
-                        return False
-
-                async def _ne_flush() -> None:
-                    if not _ne_buffer or not _run_still_current():
-                        return
-                    try:
-                        result = await adapter.send(
-                            chat_id=source.chat_id,
-                            content="\n".join(_ne_buffer),
-                            reply_to=_progress_reply_to,
-                            metadata=_progress_metadata,
-                        )
-                        if _cleanup_progress and getattr(result, "success", False) and getattr(result, "message_id", None):
-                            _cleanup_msg_ids.append(str(result.message_id))
-                    except Exception as e:
-                        logger.debug("No-edit progress send failed: %s", e)
-                    _ne_buffer.clear()
-
-                while True:
-                    try:
-                        if not _run_still_current():
-                            while not progress_queue.empty():
-                                try:
-                                    progress_queue.get_nowait()
-                                except Exception:
-                                    break
-                            return
-
-                        raw = progress_queue.get_nowait()
-                        if isinstance(raw, str) and not _ne_is_interrupted():
-                            _ne_buffer.append(raw)
-
-                    except queue.Empty:
-                        pass
-                    except asyncio.CancelledError:
-                        await _ne_flush()
-                        return
-                    except Exception as e:
-                        logger.error("Progress message error (no-edit buffer): %s", e)
-                        await asyncio.sleep(1)
-                        continue
-
-                    _now = time.monotonic()
-                    if _ne_buffer and (_now - _ne_last_send) >= _NO_EDIT_BUFFER_SECS:
-                        await _ne_flush()
-                        _ne_last_send = _now
-
-                    await asyncio.sleep(0.3)
+                interval = resolve_display_setting(
+                    user_config, platform_key, "tool_progress_buffer_interval", 3.0
+                )
+                return await _send_progress_no_edit(adapter, interval)
 
             progress_lines = []      # Accumulated tool lines
             progress_msg_id = None   # ID of the progress message to edit
